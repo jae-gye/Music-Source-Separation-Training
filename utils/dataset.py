@@ -61,6 +61,30 @@ def prepare_data(config: Union[ConfigDict, OmegaConf], args: argparse.Namespace,
         Configured DataLoader for the training split.
     """
 
+    def _build_trainset(cfg, run_args, effective_batch):
+        # [fork patch] config.training.custom_dataset = "module.path:factory" swaps in
+        # an external torch Dataset with the same (stems, mix) item contract; the
+        # factory receives (config, batch_size). Absent -> stock MSSDataset.
+        custom_spec = None
+        if 'training' in cfg:
+            try:
+                custom_spec = cfg['training'].get('custom_dataset', None)
+            except AttributeError:
+                custom_spec = None
+        if custom_spec:
+            import importlib
+            module_name, factory_name = custom_spec.split(':')
+            factory = getattr(importlib.import_module(module_name), factory_name)
+            print(f'Using custom dataset: {custom_spec}')
+            return factory(cfg, effective_batch)
+        return MSSDataset(
+            cfg,
+            run_args.data_path,
+            batch_size=effective_batch,
+            metadata_path=os.path.join(run_args.results_path, f"metadata_{run_args.dataset_type}.pkl"),
+            dataset_type=run_args.dataset_type,
+        )
+
     actionable_collate = None
     if 'augmentations' in config:
         if 'enable' in config['augmentations']:
@@ -90,13 +114,7 @@ def prepare_data(config: Union[ConfigDict, OmegaConf], args: argparse.Namespace,
         else:
             ddp_batch = batch_size
 
-        trainset = MSSDataset(
-            config,
-            args.data_path,
-            batch_size=ddp_batch,
-            metadata_path=os.path.join(args.results_path, f"metadata_{args.dataset_type}.pkl"),
-            dataset_type=args.dataset_type,
-        )
+        trainset = _build_trainset(config, args, ddp_batch)
 
         sampler = DistributedSampler(
             trainset,
@@ -117,13 +135,7 @@ def prepare_data(config: Union[ConfigDict, OmegaConf], args: argparse.Namespace,
             collate_fn=actionable_collate,
         )
     else:
-        trainset = MSSDataset(
-            config,
-            args.data_path,
-            batch_size=batch_size,
-            metadata_path=os.path.join(args.results_path, f"metadata_{args.dataset_type}.pkl"),
-            dataset_type=args.dataset_type,
-        )
+        trainset = _build_trainset(config, args, batch_size)
 
         train_loader = DataLoader(
             trainset,
