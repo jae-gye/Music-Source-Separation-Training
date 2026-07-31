@@ -448,7 +448,9 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
         model_to_valid = ema_model if ema_model is not None else model
 
         if should_print:
-            save_last_weights(args, model, device_ids, optimizer, epoch, all_time_all_metrics, best_metric, scheduler)
+            # [fork patch] pass all_losses positionally — the upstream call skipped it,
+            # shifting best_metric into the all_losses slot of the saved checkpoint
+            save_last_weights(args, model, device_ids, optimizer, epoch, all_time_all_metrics, all_losses, best_metric, scheduler)
         if ddp:
             metrics_avg, all_metrics = valid_multi_gpu(model, args, config, args.device_ids, verbose=False)
             if rank == 0:
