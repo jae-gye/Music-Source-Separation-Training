@@ -441,19 +441,26 @@ class HTDemucs(nn.Module):
         pad = hl // 2 * 3
         x = pad1d(x, (pad, pad + le * hl - x.shape[-1]), mode="reflect")
 
-        z = spectro(x, nfft, hl)[..., :-1, :]
+        # [fork patch] STFT pinned to fp32 with autocast disabled (project rule:
+        # spectral transforms never run in reduced precision)
+        with torch.cuda.amp.autocast(enabled=False):
+            z = spectro(x.float(), nfft, hl)[..., :-1, :]
         assert z.shape[-1] == le + 4, (z.shape, x.shape, le)
         z = z[..., 2: 2 + le]
         return z
 
     def _ispec(self, z, length=None, scale=0):
-        hl = self.hop_length // (4**scale)
-        z = F.pad(z, (0, 0, 0, 1))
-        z = F.pad(z, (2, 2))
-        pad = hl // 2 * 3
-        le = hl * int(math.ceil(length / hl)) + 2 * pad
-        x = ispectro(z, hl, length=le)
-        x = x[..., pad: pad + length]
+        # [fork patch] iSTFT pinned to fp32 with autocast disabled (project rule:
+        # spectral transforms never run in reduced precision)
+        with torch.cuda.amp.autocast(enabled=False):
+            z = z.to(torch.complex64)
+            hl = self.hop_length // (4**scale)
+            z = F.pad(z, (0, 0, 0, 1))
+            z = F.pad(z, (2, 2))
+            pad = hl // 2 * 3
+            le = hl * int(math.ceil(length / hl)) + 2 * pad
+            x = ispectro(z, hl, length=le)
+            x = x[..., pad: pad + length]
         return x
 
     def _magnitude(self, z):
@@ -474,7 +481,9 @@ class HTDemucs(nn.Module):
         if self.cac:
             B, S, C, Fr, T = m.shape
             out = m.view(B, S, -1, 2, Fr, T).permute(0, 1, 2, 4, 5, 3)
-            out = torch.view_as_complex(out.contiguous())
+            # [fork patch] fp32 before the complex view — no complex bfloat16 exists,
+            # and the spectral path is fp32-pinned anyway
+            out = torch.view_as_complex(out.contiguous().float())
             return out
         if self.training:
             niters = self.end_iters

@@ -4,6 +4,7 @@ __version__ = '1.0.5'
 
 import argparse
 import sys
+import time
 
 import numpy as np
 from tqdm.auto import tqdm
@@ -92,6 +93,11 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
 
     normalize = getattr(config.training, 'normalize', False)
 
+    # [fork patch] autocast dtype selectable via config.training.amp_dtype:
+    # 'float16' (stock behavior) or 'bfloat16' (fp32 exponent range, no loss scaling)
+    amp_dtype = {'float16': torch.float16, 'bfloat16': torch.bfloat16}[
+        str(getattr(config.training, 'amp_dtype', 'float16'))]
+
     get_internal_loss = (args.model_type in (
         'mel_band_roformer',
         'bs_roformer',
@@ -106,6 +112,7 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
     else:
         pbar = tqdm(train_loader)
 
+    step_wall_prev = time.time()
     for i, data in enumerate(pbar):
         if len(data)==3:
             batch, mixes, active_stem_ids = data
@@ -121,13 +128,13 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
             x, y = normalize_batch(x, y)
         if safe_mode:
             try:
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
                     loss = forward_step(x, y, active_stem_ids, get_internal_loss, model, multi_loss, device_ids)
             except Exception as e:
                 print(f'Error: {e}')
                 continue
         else:
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
                 loss = forward_step(x, y, active_stem_ids, get_internal_loss, model, multi_loss, device_ids)
         loss /= gradient_accumulation_steps
         scaler.scale(loss).backward()
@@ -167,15 +174,27 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
         else:
             li = loss.item() * gradient_accumulation_steps
             all_losses[f'epoch_{epoch}'].append(li)
-            loss_val += li
-            total += 1
-            pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1)})
-            wandb.log({'loss': 100 * li, 'avg_loss': 100 * loss_val / (i + 1), 'i': i})
+            # [fork patch] a non-finite batch loss (AMP-skipped step) must not poison
+            # the epoch average; count it instead of accumulating it
+            if np.isfinite(li):
+                loss_val += li
+                total += 1
+            # [fork patch] probe telemetry: running non-finite step count + wall time
+            # per loader step (both cheap; used by the bf16 numerics probe)
+            step_wall_now = time.time()
+            pbar.set_postfix({'loss': 100 * li, 'avg_loss': 100 * loss_val / max(total, 1)})
+            wandb.log({'loss': 100 * li, 'avg_loss': 100 * loss_val / max(total, 1), 'i': i,
+                       'nonfinite_running': (i + 1) - total,
+                       'step_seconds': step_wall_now - step_wall_prev})
+            step_wall_prev = step_wall_now
             loss.detach()
 
     if should_print:
-        print(f'Training loss: {loss_val / total}')
-        wandb.log({'train_loss': loss_val / total, 'epoch': epoch, 'learning_rate': optimizer.param_groups[0]['lr']})
+        n_bad = len(all_losses[f'epoch_{epoch}']) - total
+        print(f'Training loss: {loss_val / max(total, 1)} '
+              f'(over {total} finite steps; {n_bad} non-finite skipped)')
+        wandb.log({'train_loss': loss_val / max(total, 1), 'nonfinite_steps': n_bad,
+                   'epoch': epoch, 'learning_rate': optimizer.param_groups[0]['lr']})
 
 
 def compute_epoch_metrics(model: torch.nn.Module, args: argparse.Namespace, config: ConfigDict,
@@ -400,7 +419,13 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
         all_losses = {}
 
     multi_loss = choice_loss(args, config)
-    scaler = GradScaler()
+    # [fork patch] bf16 autocast needs no loss scaling (fp32 exponent range) — leaving
+    # the fp16 scaler live under bf16 is the classic porting bug. fp16/fp32 configs
+    # keep the stock always-on scaler, byte-identical behavior.
+    amp_dtype_name = str(getattr(config.training, 'amp_dtype', 'float16'))
+    scaler = GradScaler(enabled=(amp_dtype_name != 'bfloat16'))
+    print(f'AMP: use_amp={use_amp} amp_dtype={amp_dtype_name} '
+          f'grad_scaler_enabled={scaler.is_enabled()}')
 
     if args.set_per_process_memory_fraction:
         torch.cuda.set_per_process_memory_fraction(1.0)

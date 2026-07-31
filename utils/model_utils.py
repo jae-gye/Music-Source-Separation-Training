@@ -134,8 +134,16 @@ def demix(
     batch_size = config.inference.batch_size
 
     use_amp = getattr(config.training, 'use_amp', True)
+    # [fork patch] inference autocast dtype: config.training.inference_amp_dtype
+    # overrides training.amp_dtype; 'float32' disables autocast entirely (fp32 eval
+    # under a mixed-precision training run, so val stays comparable across arms)
+    inference_dtype_name = str(getattr(config.training, 'inference_amp_dtype',
+                                       getattr(config.training, 'amp_dtype', 'float16')))
+    inference_amp_dtype = {'float16': torch.float16, 'bfloat16': torch.bfloat16,
+                           'float32': None}[inference_dtype_name]
 
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    with torch.cuda.amp.autocast(enabled=use_amp and inference_amp_dtype is not None,
+                                 dtype=inference_amp_dtype or torch.float16):
         with torch.inference_mode():
             # Initialize result and counter tensors
             req_shape = (num_instruments,) + mix.shape

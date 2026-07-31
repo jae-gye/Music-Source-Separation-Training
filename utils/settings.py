@@ -557,6 +557,10 @@ def gen_wandb_name(args, config) -> str:
             "<model_type>_[<instrument1>-<instrument2>-...]_<YYYY-MM-DD>".
     """
 
+    # [fork patch] config.training.run_name, when present, names the run verbatim
+    # (one config = one wandb run convention); absent -> stock composed name
+    if 'run_name' in config['training'] and config['training']['run_name']:
+        return str(config['training']['run_name'])
     instrum = '-'.join(config['training']['instruments'])
     time_str = time.strftime("%Y-%m-%d")
     name = '{}_[{}]_{}'.format(args.model_type, instrum, time_str)
