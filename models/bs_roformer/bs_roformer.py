@@ -540,21 +540,25 @@ class BSRoformer(Module):
 
         stft_window = self.stft_window_fn(device=device)
 
-        try:
-            stft_repr = torch.stft(
-                raw_audio,
-                **self.stft_kwargs,
-                window=stft_window,
-                return_complex=True
-            )
-        except:
-            stft_repr = torch.stft(
-                raw_audio.cpu() if x_is_mps else raw_audio,
-                **self.stft_kwargs,
-                window=stft_window.cpu() if x_is_mps else stft_window,
-                return_complex=True
-            ).to(device)
-        stft_repr = torch.view_as_real(stft_repr)
+        # [fork patch] STFT pinned to fp32 with autocast disabled (project rule:
+        # spectral transforms never run in reduced precision). Doubly load-bearing in a
+        # spectral-only model — this transform IS the model's input representation.
+        with torch.cuda.amp.autocast(enabled=False):
+            try:
+                stft_repr = torch.stft(
+                    raw_audio.float(),
+                    **self.stft_kwargs,
+                    window=stft_window.float(),
+                    return_complex=True
+                )
+            except:
+                stft_repr = torch.stft(
+                    raw_audio.float().cpu() if x_is_mps else raw_audio.float(),
+                    **self.stft_kwargs,
+                    window=stft_window.float().cpu() if x_is_mps else stft_window.float(),
+                    return_complex=True
+                ).to(device)
+            stft_repr = torch.view_as_real(stft_repr)
 
         stft_repr = unpack_one(stft_repr, batch_audio_channel_packed_shape, '* f t c')
 
@@ -633,31 +637,35 @@ class BSRoformer(Module):
 
         stft_repr = rearrange(stft_repr, 'b f t c -> b 1 f t c')
 
-        # complex number multiplication
+        # [fork patch] complex masking + iSTFT pinned to fp32 with autocast disabled.
+        # Two reasons, both hard: torch.view_as_complex has no bfloat16 overload at all
+        # (the mask arrives bf16 straight out of the estimators, so the .float() is
+        # load-bearing, not defensive), and the project rule keeps every spectral
+        # transform out of reduced precision.
+        with torch.cuda.amp.autocast(enabled=False):
+            stft_repr = torch.view_as_complex(stft_repr.float().contiguous())
+            mask = torch.view_as_complex(mask.float().contiguous())
 
-        stft_repr = torch.view_as_complex(stft_repr)
-        mask = torch.view_as_complex(mask)
+            stft_repr = stft_repr * mask
 
-        stft_repr = stft_repr * mask
+            # istft
 
-        # istft
+            stft_repr = rearrange(stft_repr, 'b n (f s) t -> (b n s) f t', s=self.audio_channels)
 
-        stft_repr = rearrange(stft_repr, 'b n (f s) t -> (b n s) f t', s=self.audio_channels)
+            if self.zero_dc:
+                # whether to dc filter
+                stft_repr = stft_repr.index_fill(1, tensor(0, device = device), 0.)
 
-        if self.zero_dc:
-            # whether to dc filter
-            stft_repr = stft_repr.index_fill(1, tensor(0, device = device), 0.)
-
-        try:
-            recon_audio = torch.istft(stft_repr, **self.stft_kwargs, window=stft_window, return_complex=False, length=raw_audio.shape[-1])
-        except:
-            recon_audio = torch.istft(
-                stft_repr.cpu() if x_is_mps else stft_repr,
-                **self.stft_kwargs,
-                window=stft_window.cpu() if x_is_mps else stft_window,
-                return_complex=False,
-                length=raw_audio.shape[-1]
-            ).to(device)
+            try:
+                recon_audio = torch.istft(stft_repr, **self.stft_kwargs, window=stft_window.float(), return_complex=False, length=raw_audio.shape[-1])
+            except:
+                recon_audio = torch.istft(
+                    stft_repr.cpu() if x_is_mps else stft_repr,
+                    **self.stft_kwargs,
+                    window=stft_window.float().cpu() if x_is_mps else stft_window.float(),
+                    return_complex=False,
+                    length=raw_audio.shape[-1]
+                ).to(device)
 
         recon_audio = rearrange(
             recon_audio,
@@ -688,8 +696,12 @@ class BSRoformer(Module):
                 **self.multi_stft_kwargs,
             )
 
-            recon_Y = torch.stft(rearrange(recon_audio, 'b n s t -> (b n s) t'),**res_stft_kwargs)
-            target_Y = torch.stft(rearrange(target_sel, 'b n s t -> (b n s) t'),**res_stft_kwargs)
+            # [fork patch] same fp32 rule for the internal multi-resolution STFT loss.
+            # exp003.0 runs --use_standard_loss so this path is dead, but leaving one
+            # unpinned STFT behind is exactly how the rule gets quietly broken later.
+            with torch.cuda.amp.autocast(enabled=False):
+                recon_Y = torch.stft(rearrange(recon_audio.float(), 'b n s t -> (b n s) t'),**res_stft_kwargs)
+                target_Y = torch.stft(rearrange(target_sel.float(), 'b n s t -> (b n s) t'),**res_stft_kwargs)
 
             multi_stft_resolution_loss = multi_stft_resolution_loss + F.l1_loss(recon_Y, target_Y)
 

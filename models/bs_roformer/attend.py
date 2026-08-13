@@ -84,6 +84,17 @@ class Attend(nn.Module):
 
         config = self.cuda_config if is_cuda else self.cpu_config
 
+        # [fork patch] There is no fp32 flash-attention kernel. On compute capability
+        # >= 8.0 the config above enables flash ONLY (math and mem-efficient are both
+        # switched off), so an fp32 forward raises "No available kernel" — which is
+        # precisely what our fp32 evaluation does, while bf16 training is unaffected.
+        # Fall back to the math / mem-efficient backends whenever the inputs are not a
+        # half type. Training behaviour is byte-for-byte unchanged: under bf16 autocast
+        # q/k/v are bf16 and the original flash config is used.
+        if is_cuda and q.dtype not in (torch.float16, torch.bfloat16):
+            config = FlashAttentionConfig(enable_flash=False, enable_math=True,
+                                          enable_mem_efficient=True)
+
         # pytorch 2.0 flash attn: q, k, v, mask, dropout, softmax_scale
 
         with torch.backends.cuda.sdp_kernel(**config._asdict()):
