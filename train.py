@@ -137,9 +137,21 @@ def train_one_epoch(model: torch.nn.Module, config: ConfigDict, args: argparse.N
             with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_dtype):
                 loss = forward_step(x, y, active_stem_ids, get_internal_loss, model, multi_loss, device_ids)
         loss /= gradient_accumulation_steps
-        scaler.scale(loss).backward()
 
-        if ((i + 1) % gradient_accumulation_steps == 0) or (i == len(train_loader) - 1):
+        # [fork patch] Only let DDP all-reduce on the micro-step that actually ends an
+        # accumulation cycle. Upstream called backward() unconditionally, so the whole
+        # 255M-parameter gradient crossed the interconnect on EVERY micro-step —
+        # gradient_accumulation_steps times the traffic the maths requires (16x under
+        # exp003.x's accum, 8x under the 2-GPU recipe). no_sync() just defers the
+        # reduction; the accumulated gradient, and therefore the update, is identical.
+        is_sync_step = ((i + 1) % gradient_accumulation_steps == 0) or (i == len(train_loader) - 1)
+        if ddp and not is_sync_step:
+            with model.no_sync():
+                scaler.scale(loss).backward()
+        else:
+            scaler.scale(loss).backward()
+
+        if is_sync_step:
 
             scaler.unscale_(optimizer)
 
@@ -361,12 +373,45 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
     if ddp:
         device = torch.device(f'cuda:{rank}')
         model.to(device)
-        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=True)
+        # [fork patch] find_unused_parameters=True makes DDP walk the autograd graph after
+        # every backward to discover parameters that produced no gradient. BS-RoFormer
+        # uses all of them (all nine mask estimators are on the loss path under
+        # --use_standard_loss), so the traversal is pure overhead on a 255M-parameter
+        # model. If a future model genuinely leaves parameters unused, DDP raises a loud,
+        # specific error naming them — which is better than paying this silently forever.
+        model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[rank], find_unused_parameters=False)
         model_module = model.module
     else:
         device, model = initialize_model_and_device(model, args.device_ids)
         # If model is DataParallel, get underlying module
         model_module = model.module if hasattr(model, 'module') else model
+
+    # [fork patch] Optional torch.compile, gated on config.training.use_torch_compile so
+    # that enabling it is a recorded property of the run and not an ambient default.
+    #
+    # MEASURED on this box (RTX PRO 6000 Blackwell sm_120, torch 2.11.0+cu128, the
+    # exp003.0 BS-RoFormer geometry, scripts/bench_compile.py):
+    #     batch 2  eager   0.5826 s/step  40.7 GiB
+    #     batch 2  compile 0.3049 s/step  36.0 GiB   1.91x
+    #     batch 4  compile 0.5239 s/step  68.5 GiB   2.22x per item
+    # The gain is structural rather than lucky: BS-RoFormer emits 550+ small sequential
+    # kernels per forward (BandSplit's 62-band Python loop, then 62 bands x 9 mask
+    # estimators), which is why the DCGM counters showed smActive ~87% against
+    # pipeTensorActive ~12%. Fusion is exactly the lever that profile calls for. The
+    # first optimizer step pays a ~75 s graph build; every later step is flat.
+    #
+    # ORDER MATTERS, for two independent reasons, and compiling AFTER the wrapper is the
+    # only order that satisfies both:
+    #   1. TorchDynamo can then apply DDPOptimizer, which splits the graph on DDP bucket
+    #      boundaries so the all-reduce overlaps compute (pytorch notes/ddp.rst).
+    #   2. save_weights() persists model.module.state_dict(). Compiling the INNER module
+    #      would leave .module pointing at the OptimizedModule, prefixing every key with
+    #      '_orig_mod.' — checkpoints that neither exp003.x nor src/eval could load, and
+    #      nothing would say so until the next evaluation failed.
+    if bool(getattr(config.training, 'use_torch_compile', False)):
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print('torch.compile: ON (the first step pays a one-off graph build)', flush=True)
+        model = torch.compile(model)
 
     ema_model = None
     if hasattr(config.training, 'ema_momentum') and config.training.ema_momentum > 0:
@@ -478,8 +523,18 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
             save_last_weights(args, model, device_ids, optimizer, epoch, all_time_all_metrics, all_losses, best_metric, scheduler)
         if ddp:
             metrics_avg, all_metrics = valid_multi_gpu(model, args, config, args.device_ids, verbose=False)
+            # [fork patch] Every rank has to step its own scheduler, on the same number.
+            # valid_multi_gpu returns (None, None) off rank 0, so upstream ran
+            # compute_epoch_metrics — which owns the scheduler.step(metric) call — inside
+            # `if rank == 0`. Only rank 0's ReduceLROnPlateau ever advanced. The first time
+            # the plateau reducer fires, rank 0 trains at half the learning rate of every
+            # other rank; DDP all-reduces gradients but never re-syncs parameters, so the
+            # replicas silently diverge from that epoch on, with nothing in the log saying
+            # so. Broadcasting the metric keeps every rank's scheduler state identical.
+            sched_metric = torch.zeros(1, dtype=torch.float64, device=device)
             if rank == 0:
                 all_time_all_metrics[f"epoch_{epoch}"] = all_metrics
+                sched_metric[0] = float(metrics_avg[args.metric_for_scheduler])
                 best_metric = compute_epoch_metrics(
                     model=model,
                     args=args,
@@ -496,6 +551,14 @@ def train_model(args: Union[argparse.Namespace, None], rank=None, world_size=Non
                     metrics_avg=metrics_avg,
                     all_metrics=all_metrics
                 )
+            # rank 0 stepped its scheduler inside compute_epoch_metrics; everyone else
+            # steps here, on the identical broadcast value, so the LR stays one number.
+            dist.broadcast(sched_metric, src=0)
+            if rank != 0 and scheduler.name in ['ReduceLROnPlateau']:
+                scheduler.step(sched_metric.item())
+            # hold the ranks together across rank 0's ~3 GB checkpoint write, so the
+            # next epoch starts from one line rather than staggered
+            dist.barrier()
         else:
             best_metric = compute_epoch_metrics(
                 model=model,
