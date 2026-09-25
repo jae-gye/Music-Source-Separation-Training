@@ -528,9 +528,19 @@ def initialize_environment_ddp(rank: int, world_size: int, seed: int = 0, resuls
     Returns:
         None
     """
-    seed = (seed + int(time.time())) % 55535 + 10000
+    # [fork patch] Upstream derived BOTH the RNG seed and the DDP rendezvous port from
+    # `(seed + int(time.time())) % 55535 + 10000`. Two defects followed from that one line.
+    # (1) Every mp.spawn child evaluates the clock independently, after its own torch
+    #     import, so ranks landing either side of a one-second boundary computed DIFFERENT
+    #     MASTER_PORTs (see setup_ddp) and the rendezvous hung until the timeout.
+    # (2) It discarded the caller's --seed. This project pins the seed on three surfaces
+    #     per experiment and runs explicit seed twins (exp003.1), so a clock-derived seed
+    #     makes a DDP run unreproducible by construction.
+    # The port is now chosen once by the parent process (train_ddp.py) and inherited
+    # through the environment; the seed is the declared one, offset by rank so each
+    # replica still draws an independent dropout/augmentation stream.
+    manual_seed(seed + rank)
     setup_ddp(rank, world_size, seed)
-    manual_seed(seed)
 
     try:
         torch.multiprocessing.set_start_method('spawn', force=True)  # force=True prevent errors
@@ -628,7 +638,12 @@ def setup_ddp(rank: int, world_size: int, seed: int) -> None:
     """
 
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(seed)
+    # [fork patch] `seed` is NO LONGER the port. Upstream wrote str(seed) here, and seed
+    # was clock-derived per child (see initialize_environment_ddp), so two ranks could
+    # rendezvous on two different ports. The parent picks one port before mp.spawn and
+    # every child inherits it through the environment; setdefault keeps that value and
+    # only invents one if some other entry point forgot to.
+    os.environ.setdefault('MASTER_PORT', str(find_free_port()))
     os.environ["USE_LIBUV"] = "0"
     try:
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
