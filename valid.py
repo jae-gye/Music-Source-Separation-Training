@@ -776,28 +776,44 @@ def valid_multi_gpu(
                 for metric_name in args.metrics:
                     local_metrics[metric_name][instr] = single_metrics[metric_name][instr]
 
+        # [fork patch] Gather the per-track metric MAPS, not zero-padded value vectors.
+        #
+        # Upstream padded each rank's per-instrument list up to `target_len` with 0.0 and
+        # all_gathered fixed-width tensors. That is only sound if every track carries
+        # every instrument. Ours do not: over the 91-song validation set the per-stem
+        # coverage is ragged (양금 9 songs, 기타 23, 아쟁 59 ... 타악기 88), so the padding
+        # injected dozens of literal 0.0 dB scores into every sparse instrument's mean.
+        # Measured consequence: exp003.2's ep17 "Metric avg si_sdr: 10.1379" reads about
+        # 6.2 once it goes through this path. That number drives ReduceLROnPlateau, the
+        # best-checkpoint test and every per-stem figure the project reports, so a DDP run
+        # on the unpatched code optimises against a fiction — quietly, with no error.
+        #
+        # Under DDP process_audio_files keys its metrics by track path, so gathering the
+        # dicts and merging them is both correct and self-deduplicating: the tracks padded
+        # onto all_mixtures_path above to make the split even collapse back onto their
+        # originals instead of being counted twice. compute_metric_avg already accepts
+        # this {path: value} form — its own docstring calls it the DDP form.
+        # The OUTPUT TYPE stays what it has always been here — a plain list of floats per
+        # instrument — because train.py:242 does np.array(values).mean() on it. Only the
+        # CONTENT changes: real scores only, each track counted once.
         all_metrics: Dict[str, Dict[str, List[float]]] = {m: {} for m in args.metrics}
         for metric in args.metrics:
             for instr in config.training.instruments:
-                all_metrics[metric][instr] = []
                 per_instr = local_metrics[metric][instr]
                 if isinstance(per_instr, dict):
-                    local_data = list(per_instr.values())
+                    local_map = {str(k): float(v) for k, v in per_instr.items()}
                 else:
-                    local_data = list(per_instr)
+                    # defensive: rank-unique keys, so merging cannot silently drop values
+                    local_map = {f'rank{rank}:{i}': float(v) for i, v in enumerate(per_instr)}
 
-                if len(local_data) == 0:
-                    local_tensor = torch.zeros(target_len, dtype=torch.float32, device=device)
-                else:
-                    if len(local_data) < target_len:
-                        local_data = local_data + [0.0] * (target_len - len(local_data))
-                    local_tensor = torch.tensor(local_data, dtype=torch.float32, device=device)
+                gathered_maps: List[Optional[Dict[str, float]]] = [None] * world_size
+                dist.all_gather_object(gathered_maps, local_map)
 
-                gathered_list = [torch.zeros_like(local_tensor) for _ in range(world_size)]
-                dist.all_gather(gathered_list, local_tensor)
-
-                cat_vals = torch.cat(gathered_list).tolist()[:num_tracks]
-                all_metrics[metric][instr] = cat_vals
+                merged: Dict[str, float] = {}
+                for part in gathered_maps:
+                    if part:
+                        merged.update(part)
+                all_metrics[metric][instr] = list(merged.values())
 
         if dist.get_rank() == 0:
             instruments = prefer_target_instrument(config)
